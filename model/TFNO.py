@@ -20,9 +20,11 @@ class TemporalFourierEmbedding(nn.Module):
         self.register_buffer('t_embedding', torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=1))  # (n_steps, 2*embed_dim)
 
     def forward(self, x):
-        # x: (..., n_steps)
-        # return: (..., n_steps, 2*embed_dim)
-        return self.t_embedding.expand(*x.shape[:-1], -1, -1)
+        # x: (batch, in_channels, N)
+        # self.t_embedding: (N, 2*t_embed_dim)
+        bsz = x.size(0)
+        # (1, N, 2*t_embed_dim) -> (batch, N, 2*t_embed_dim)
+        return self.t_embedding.unsqueeze(0).expand(bsz, -1, -1)
 
 # SpectralConv1d, TFNO1d 정의 (FNO1d와 거의 동일)
 class SpectralConv1d(nn.Module):
@@ -39,7 +41,9 @@ class SpectralConv1d(nn.Module):
         x_ft = torch.fft.rfft(x, dim=-1)
         out_ft = torch.zeros(batch, self.out_channels, x_ft.size(-1), dtype=torch.cfloat, device=x.device)
         out_ft[:, :, :self.modes1] = torch.einsum(
-            "bci,cio->boi", x_ft[:, :, :self.modes1], self.weights
+            "bci,coi->boi",
+            x_ft[:, :, :self.modes1],
+            self.weights
         )
         x = torch.fft.irfft(out_ft, n=N, dim=-1)
         return x

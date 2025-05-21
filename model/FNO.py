@@ -27,7 +27,9 @@ class SpectralConv1d(nn.Module):
         x_ft = torch.fft.rfft(x, dim=-1)  # (batch, in_channels, N//2+1)
         out_ft = torch.zeros(batch, self.out_channels, x_ft.size(-1), dtype=torch.cfloat, device=x.device)
         out_ft[:, :, :self.modes1] = torch.einsum(
-            "bci,cio->boi", x_ft[:, :, :self.modes1], self.weights
+            "bci,coi->boi",   # b: batch, c: in_ch, i: mode index, o: out_ch
+            x_ft[:, :, :self.modes1],
+            self.weights
         )
         x = torch.fft.irfft(out_ft, n=N, dim=-1)  # (batch, out_channels, N)
         return x
@@ -109,6 +111,8 @@ def train_fno(
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    
+    print(f"width: {width}, modes1: {modes1}, depth: {depth}")
 
     # 데이터 준비
     a_seq, r_seq = load_three_body_fno(

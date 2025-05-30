@@ -201,7 +201,7 @@ def train_single_step_distill(
         
         if log_path is not None:
             with open(log_path, "a") as f:
-                f.write(f"{epoch},{avg_loss},{avg_loss},{avg_phys},{val_loss},{val_distill},{val_phys}\n")
+                f.write(f"{epoch},{avg_loss},{avg_distill},{avg_phys},{val_loss},{val_distill},{val_phys}\n")
         
         if val_loss < best_val:
             best_val = val_loss

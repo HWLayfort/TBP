@@ -186,7 +186,7 @@ def train_single_step_distill_deeponet(
         
         if log_path is not None:
             with open(log_path, "a") as f:
-                f.write(f"{epoch},{avg_loss},{avg_loss},{avg_phys},{val_loss},{val_distill},{val_phys}\n")
+                f.write(f"{epoch},{avg_loss},{avg_distill},{avg_phys},{val_loss},{val_distill},{val_phys}\n")
         
         if val_loss < best_val:
             best_val = val_loss
@@ -277,8 +277,8 @@ def run_deeponettopinn_pipeline():
     respinn_student = ResPINN(input_dim=22, hidden_dim=128, num_hidden_layers=8, output_dim=9)
     
     # Knowledge Distillation: FNO, TFNO, DeepONet → PINN
-    transfer_train(pinn_student, deeponet_teacher, data_dir='data/output', num_epochs=500, model_save_path="deeponet_to_pinn.pth", log_path='deeponet_to_pinn.log')
-    transfer_train(fpinn_student, deeponet_teacher, data_dir='data/output', num_epochs=500, model_save_path="deeponet_to_fpinn.pth", log_path='deeponet_to_fpinn.log')
+    # transfer_train(pinn_student, deeponet_teacher, data_dir='data/output', num_epochs=500, model_save_path="deeponet_to_pinn.pth", log_path='deeponet_to_pinn.log')
+    # transfer_train(fpinn_student, deeponet_teacher, data_dir='data/output', num_epochs=500, model_save_path="deeponet_to_fpinn.pth", log_path='deeponet_to_fpinn.log')
     transfer_train(respinn_student, deeponet_teacher, data_dir='data/output', num_epochs=500, model_save_path="deeponet_to_respinn.pth", log_path='deeponet_to_respinn.log')
     
 if __name__ == "__main__":

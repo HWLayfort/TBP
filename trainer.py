@@ -29,14 +29,14 @@ def run_all_pipelines():
     
 def run_all_tranfer_pipelines():
     print("Running FNO to PINN transfer pipeline...")
-    run_fnotopinn_pipeline()
+    # run_fnotopinn_pipeline()
     
     print("Running TFNO to PINN transfer pipeline...")
     run_tfnotopinn_pipeline()
     
     print("Running DeepONet to PINN transfer pipeline...")
-    run_deeponettopinn_pipeline()
+    # run_deeponettopinn_pipeline()
     
 if __name__ == "__main__":
-    run_all_tranfer_pipelines()
+    # run_all_tranfer_pipelines()
     run_all_pipelines()

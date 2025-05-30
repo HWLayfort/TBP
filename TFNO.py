@@ -224,7 +224,7 @@ def run_tfno_pipeline():
     n_steps = dataset[0][0].shape[1]
     print(f"Number of time steps: {n_steps}")
     model = TFNO(
-        t_steps=n_steps, input_dim=22, embed_dim=32, width=64, modes=32,
+        t_steps=10000, input_dim=22, embed_dim=32, width=64, modes=32,
         depth=4, output_dim=9
     )
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

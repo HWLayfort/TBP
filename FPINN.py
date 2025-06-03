@@ -1,5 +1,6 @@
+from DataLoader import TBPDataset, compute_scalers
+
 import os
-import glob
 import numpy as np
 import pandas as pd
 import torch
@@ -8,277 +9,202 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-# ======== 데이터셋 정의 ==========
-
-class ThreeBodyDataset(Dataset):
-    def __init__(self, csv_path):
-        self.csv_path = csv_path
-        filename = os.path.basename(csv_path)
-        base = filename.split('_')[0]
-        mass_str = base.replace('m', '')
-        self.masses = np.array([float(x) for x in mass_str.split('-')])
-        df = pd.read_csv(csv_path, header=None)
-        self.t = df.iloc[:, 0].values
-        self.r = df.iloc[:, 1:10].values.reshape(-1, 3, 3)
-        self.v = df.iloc[:, 10:19].values.reshape(-1, 3, 3)
-        self.r0 = self.r[0]
-        self.v0 = self.v[0]
-        self.length = len(df)
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        sample = {
-            't': torch.tensor(self.t[idx], dtype=torch.float32),       # ()
-            'r': torch.tensor(self.r[idx], dtype=torch.float32),       # (3, 3)
-            'v': torch.tensor(self.v[idx], dtype=torch.float32),       # (3, 3)
-            'm': torch.tensor(self.masses, dtype=torch.float32),       # (3,)
-            'r0': torch.tensor(self.r0, dtype=torch.float32),          # (3, 3)
-            'v0': torch.tensor(self.v0, dtype=torch.float32)           # (3, 3)
-        }
-        return sample
-
-class ThreeBodyPINNDataset(Dataset):
-    def __init__(self, filelist):
-        self.datasets = [ThreeBodyDataset(f) for f in filelist]
-        self.all_data = []
-        for ds in self.datasets:
-            for i in range(len(ds)):
-                d = ds[i]
-                input_vec = np.concatenate([
-                    np.array([d['t']]),
-                    d['r0'].reshape(-1),
-                    d['v0'].reshape(-1),
-                    d['m'].reshape(-1)
-                ])
-                output_vec = d['r'].reshape(-1)
-                v_vec = d['v'].reshape(-1)
-                self.all_data.append((input_vec, output_vec, v_vec, d['m']))
-    def __len__(self):
-        return len(self.all_data)
-    def __getitem__(self, idx):
-        x, r, v, m = self.all_data[idx]
-        return (
-            torch.tensor(x, dtype=torch.float32),
-            torch.tensor(r, dtype=torch.float32),
-            torch.tensor(v, dtype=torch.float32),
-            torch.tensor(m, dtype=torch.float32)
-        )
-
-# ======= Fourier Feature Mapping for t (FPINN) ==========
-class FourierFeatureMapping(nn.Module):
-    def __init__(self, input_dim=1, mapping_size=32, scale=10.0):
+# =======================
+# Fourier Feature Mapping
+# =======================
+class FourierEmbedding(nn.Module):
+    def __init__(self, embed_dim=32, scale=10.0):
         super().__init__()
-        self.B = nn.Parameter(
-            torch.randn(input_dim, mapping_size) * scale,
-            requires_grad=False
-        )
-    def forward(self, x):
-        # x: (batch, 1)
-        x_proj = 2.0 * np.pi * x @ self.B   # (batch, mapping_size)
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)  # (batch, 2*mapping_size)
+        self.B = nn.Parameter(torch.randn((1, embed_dim)) * scale, requires_grad=False)
 
-# ======= FPINN 모델 ==========
+    def forward(self, t):  # t: (B, N, 1)
+        x_proj = 2 * np.pi * t @ self.B  # (B, N, embed_dim)
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)  # (B, N, 2*embed_dim)
+
 class FPINN(nn.Module):
-    def __init__(self, mapping_size=32, scale=10.0, hidden_dim=128, num_hidden_layers=8, output_dim=9):
+    def __init__(self, input_dim=22, embed_dim=32, hidden_dim=128, depth=4, output_dim=9, dropout_rate=0.2):
         super().__init__()
-        self.ff = FourierFeatureMapping(input_dim=1, mapping_size=mapping_size, scale=scale)
-        self.input_dim = 2 * mapping_size + 9 + 9 + 3  # Fourier(t) + r0 + v0 + m
-        self.input_layer = nn.Linear(self.input_dim, hidden_dim)
-        self.hidden_layers = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim) for _ in range(num_hidden_layers)
-        ])
-        self.output_layer = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.Tanh()
-    def forward(self, x):
-        t = x[:, [0]].clone()      # (batch, 1)
-        r0 = x[:, 1:10]            # (batch, 9)
-        v0 = x[:, 10:19]           # (batch, 9)
-        m = x[:, 19:22]            # (batch, 3)
-        t_feat = self.ff(t)        # (batch, 2*mapping_size)
-        x_in = torch.cat([t_feat, r0, v0, m], dim=-1)
-        x = self.activation(self.input_layer(x_in))
-        for layer in self.hidden_layers:
-            x = self.activation(layer(x))
-        return self.output_layer(x)
+        self.fourier = FourierEmbedding(embed_dim=embed_dim)
+        
+        layers = [nn.Linear(input_dim + 2*embed_dim, hidden_dim), nn.Tanh(), nn.Dropout(dropout_rate)]
+        for _ in range(depth - 1):
+            layers += [
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+            ]
+        layers += [nn.Linear(hidden_dim, output_dim)]
+        self.net = nn.Sequential(*layers)
 
-# ======= Physics residual (Three-body ODE) ==========
-def compute_physics_residual(r_pred, a_pred, masses, G=1.0, eps=1e-8):
-    B = r_pred.shape[0]
-    r = r_pred.view(B, 3, 3)
-    a = a_pred.view(B, 3, 3)
-    m = masses.view(B, 1, 3, 1)  # (B,1,3,1)
-    diff = r.unsqueeze(2) - r.unsqueeze(1)    # (B,3,3,3)
-    norm = torch.norm(diff, dim=-1, keepdim=True) + eps   # (B,3,3,1)
-    a_grav = G * m * diff / (norm ** 3)      # (B,3,3,3)
-    mask = 1 - torch.eye(3, device=r.device).view(1, 3, 3, 1)
-    a_grav = (a_grav * mask).sum(dim=2)      # (B,3,3)
-    return (a - a_grav).view(B, -1)
+    def forward(self, x_cond, t):  
+        # x_cond: (B, 21)
+        # t: (B, N, 1)
+        B, N, _ = t.shape
+        t_feat = self.fourier(t)  # (B, N, 2*embed_dim)
+        x_repeated = x_cond.unsqueeze(1).expand(-1, N, -1)  # (B, N, 21)
+        x_input = torch.cat([x_repeated, t_feat], dim=-1)  # (B, N, 21+2*embed)
+        x_input = x_input.view(B * N, -1)  # (B*N, D)
+        out = self.net(x_input)  # (B*N, output_dim)
+        return out.view(B, N, -1).permute(0, 2, 1)  # (B, output_dim, N)
+    
+# =====================
+# Physics Components
+# =====================
+def compute_second_derivative(y, dt):
+    dt = dt.view(-1, 1, 1)  # reshape to (B, 1, 1) for broadcasting
+    return (y[:, :, 2:] - 2 * y[:, :, 1:-1] + y[:, :, :-2]) / (dt ** 2)
 
-# ======= Finite difference로 가속도 =======
-def compute_acceleration(model, x, eps=1e-3):
-    def shift_t(x, delta):
-        x_new = x.clone()
-        x_new[:, 0] = x[:, 0] + delta
-        return x_new
 
-    r      = model(x)
-    r_p1   = model(shift_t(x, +eps))
-    r_m1   = model(shift_t(x, -eps))
-    r_p2   = model(shift_t(x, +2*eps))
-    r_m2   = model(shift_t(x, -2*eps))
+def compute_gravity_acceleration(r, masses, G=1.0, eps=1e-8):
+    B, _, N = r.shape
+    r = r.view(B, 3, 3, N)
+    a = torch.zeros_like(r)
+    for i in range(3):
+        for j in range(3):
+            if i != j:
+                rij = r[:, j, :, :] - r[:, i, :, :]
+                dist = torch.norm(rij, dim=1, keepdim=True) + eps
+                a[:, i, :, :] += G * masses[:, j].unsqueeze(-1).unsqueeze(-1) * rij / (dist ** 3)
+    return a.view(B, 9, N)
 
-    a = (-r_m2 + 16*r_m1 - 30*r + 16*r_p1 - r_p2) / (12 * eps**2)
-    return a
-
-# ======= 평가 함수 ==========
-def eval_loop(model, dataloader, device, loss_fn, weight_phys=1.0, desc="Eval", require_physics=False):
-    model.eval()
-    total_loss = 0.0
-    total_phy_loss = 0.0
-    n = 0
-    for xb, yb, vb, mb in tqdm(dataloader, desc=desc):
-        xb = xb.to(device)
-        yb = yb.to(device)
-        mb = mb.to(device)
-        y_pred = model(xb)
-        loss = loss_fn(y_pred, yb)
-        if require_physics:
-            xb_req = xb.clone().detach()
-            r_pred = model(xb_req)
-            a_pred = compute_acceleration(model, xb_req)
-            phy_res = compute_physics_residual(r_pred, a_pred, mb)
-            phy_loss = (phy_res**2).mean()
-            total_phy_loss += phy_loss.item() * xb.size(0)
-            loss = loss + weight_phys * phy_loss
-        total_loss += loss.item() * xb.size(0)
-        n += xb.size(0)
-    avg_loss = total_loss / n
-    avg_phy_loss = total_phy_loss / n if require_physics else None
-    return avg_loss, avg_phy_loss
-
-def test_loop(model, dataloader, device, loss_fn, desc="Test"):
-    """
-    Test 단계에서는 오직 예측값과 실제값(ground-truth) 사이의 MSE만 평가한다.
-    Physics residual(physics loss)는 포함하지 않는다.
-    """
-    model.eval()
-    total_loss = 0.0
-    n = 0
-    with torch.no_grad():
-        for xb, yb, vb, mb in tqdm(dataloader, desc=desc):
-            xb = xb.to(device)
-            yb = yb.to(device)
-            # mb = mb.to(device) # masses, 사용하지 않음
-            y_pred = model(xb)
-            loss = loss_fn(y_pred, yb)
-            total_loss += loss.item() * xb.size(0)
-            n += xb.size(0)
-    avg_loss = total_loss / n
-    return avg_loss
-
-# ======= 학습 함수 (early stopping 포함) ==========
-def train_loop(
-        model, 
-        train_loader, 
-        val_loader, 
-        test_loader, 
-        num_epochs=100, 
-        lr=1e-3, 
-        device='cuda', 
-        weight_phys=1.0, 
-        model_save_path='fpinn.pth', 
-        log_path='fpinn.log',
-        early_stop_patience=20
-    ):
-    print(f"Training FPINN on device: {device}")
+# =======================
+# Training and Evaluation
+# =======================
+def train_fpinn(
+    model, train_loader, val_loader, num_epochs=100, lr=1e-3, device='cuda',
+    x_scaler=None, y_scaler=None,
+    model_save_path='fpinn.pth', log_path='fpinn.log', early_stop_patience=20,
+    phys_loss_weight=1e-7,
+):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     best_val = float('inf')
-    best_epoch = 0
     patience = 0
-    
-    if log_path is not None:
+
+    if log_path:
         with open(log_path, "w") as f:
-            f.write("epoch,train_loss,train_phy_loss,val_loss,val_phy_loss\n")
-    
+            f.write("epoch,train_loss,train_phys,val_loss,val_phys\n")
+
     for epoch in range(num_epochs):
-        # ----- Train -----
         model.train()
-        total_loss = 0.0
-        total_phy_loss = 0.0
-        n = 0
-        for xb, yb, vb, mb in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
-            xb = xb.to(device)
-            yb = yb.to(device)
-            mb = mb.to(device)
+        train_loss, train_phys, n = 0.0, 0.0, 0
+        for xb, yb, _, mb in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
+            xb, yb, mb = x_scaler.transform(xb.to(device)), y_scaler.transform(yb.to(device)), mb.to(device)    
+            x_cond = xb[:, :21, 0]                 # (B, 21)
+            t = xb[:, 21:, :].permute(0, 2, 1)     # (B, N, 1)
             optimizer.zero_grad()
-            y_pred = model(xb)
-            loss = loss_fn(y_pred, yb)
-            xb_req = xb.clone().detach()
-            r_pred = model(xb_req)
-            a_pred = compute_acceleration(model, xb_req)
-            phy_res = compute_physics_residual(r_pred, a_pred, mb)
-            phy_loss = (phy_res**2).mean()
-            total_phy_loss += phy_loss.item() * xb.size(0)
-            loss = loss + weight_phys * phy_loss
+            y_pred = model(x_cond, t)
+            loss_data = loss_fn(y_pred, yb)
+            dt = xb[:, -1, 1] - xb[:, -1, 0]
+            y_pred_phys = y_scaler.inverse_transform(y_pred)
+            a_pred = compute_second_derivative(y_pred_phys, dt)
+            a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]  # <--- 수정
+            loss_phys = ((a_pred - a_grav) ** 2).mean()
+            loss_phys_scaled = loss_phys * (loss_data.detach() / (loss_phys.detach() + 1e-8))
+            loss = loss_data + phys_loss_weight * loss_phys_scaled
             loss.backward()
             optimizer.step()
-            total_loss += loss.item() * xb.size(0)
+            train_loss += loss_data.item() * xb.size(0)
+            train_phys += loss_phys.item() * xb.size(0)
             n += xb.size(0)
-        avg_loss = total_loss / n
-        avg_phy_loss = total_phy_loss / n
-        
-        val_loss, val_phy_loss = eval_loop(model, val_loader, device, loss_fn, weight_phys=weight_phys, desc="Val", require_physics=True)
-        
-        if epoch % 10 == 0: 
-            print(f"[Epoch {epoch+1}] Train Loss: {avg_loss:.6f}, Train Physics Loss: {avg_phy_loss:.6f}, Val Loss: {val_loss:.6f}, Val Physics Loss: {val_phy_loss:.6f}")
-            
-        if log_path is not None:
+        train_loss /= n
+        train_phys /= n
+
+        # Validation
+        model.eval()
+        val_loss, val_phys, nv = 0.0, 0.0, 0
+        with torch.no_grad():
+            for xb, yb, _, mb in tqdm(val_loader, desc=f"Val {epoch+1}", leave=False):
+                xb, yb, mb = x_scaler.transform(xb.to(device)), y_scaler.transform(yb.to(device)), mb.to(device)
+                x_cond = xb[:, :21, 0]                 # (B, 21)
+                t = xb[:, 21:, :].permute(0, 2, 1)     # (B, N, 1)
+                y_pred = model(x_cond, t)
+                loss_data = loss_fn(y_pred, yb)
+                dt = xb[:, -1, 1] - xb[:, -1, 0]
+                y_pred_phys = y_scaler.inverse_transform(y_pred)
+                a_pred = compute_second_derivative(y_pred_phys, dt)
+                a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]  # <--- 수정
+                loss_phys = ((a_pred - a_grav) ** 2).mean()
+                val_loss += loss_data.item() * xb.size(0)
+                val_phys += loss_phys.item() * xb.size(0)
+                nv += xb.size(0)
+        val_loss /= nv
+        val_phys /= nv
+
+        if log_path:
             with open(log_path, "a") as f:
-                f.write(f"{epoch},{avg_loss},{avg_phy_loss},{val_loss},{val_phy_loss}\n")
+                f.write(f"{epoch},{train_loss},{train_phys},{val_loss},{val_phys}\n")
 
         if val_loss < best_val:
             best_val = val_loss
-            best_epoch = epoch
             patience = 0
-            torch.save(model.state_dict(), os.path.join(os.path.dirname(model_save_path), model_save_path))
+            torch.save(model.state_dict(), model_save_path)
         else:
             patience += 1
             if patience >= early_stop_patience:
-                print(f"Early stopping at epoch {epoch+1}: no improvement in {early_stop_patience} epochs.")
+                print(f"Early stopping at epoch {epoch+1}")
                 break
-        
-    print(f"Best validation loss: {best_val:.6f} (epoch {best_epoch+1})")
-    # ----- Test -----
-    test_loss = test_loop(model, test_loader, device, nn.MSELoss(), desc="Test (MSE only)")
-    print(f"[Test] Final Test Loss (MSE only): {test_loss:.6f}")
 
+        if epoch % 10 == 0:
+            print(f"[Epoch {epoch+1}] Train: {train_loss:.6f}, Phys: {train_phys:.6f} | Val: {val_loss:.6f}, Phys: {val_phys:.6f}")
+
+    print(f"Best validation loss: {best_val:.6f}")
+
+def test_fpinn(model, test_loader, x_scaler, y_scaler, device='cuda', log_path='fpinn.log'):
+    model.eval()
+    loss_fn = nn.MSELoss()
+    test_loss, n = 0.0, 0
+    with torch.no_grad():
+        for xb, yb, _, _ in tqdm(test_loader, desc="Test"):
+            xb, yb = x_scaler.transform(xb.to(device)), y_scaler.transform(yb.to(device))
+            x_cond = xb[:, :21, 0]                 # (B, 21)
+            t = xb[:, 21:, :].permute(0, 2, 1)     # (B, N, 1)
+            y_pred = model(x_cond, t)
+            loss = loss_fn(y_pred, yb)
+            test_loss += loss.item() * xb.size(0)
+            n += xb.size(0)
+    test_loss /= n
+    print(f"[Test] Loss: {test_loss:.6f}")
     if log_path is not None:
         with open(log_path, "a") as f:
             f.write(f"test,{test_loss}\n")
+    return test_loss
 
-# ======= 전체 파이프라인 ==========
-def run_fpinn_pipeline():
-    data_dir = os.path.join(os.path.dirname(__file__), "data", "output")
-    file_list = [os.path.join(data_dir, fname) for fname in os.listdir(data_dir) if fname.endswith('.csv')]
-    dataset = ThreeBodyPINNDataset(file_list)
-    print(f"Loaded dataset with {len(dataset)} samples.")
-    # 데이터셋 분할
-    total = len(dataset)
-    n_train = int(0.7 * total)
-    n_val = int(0.15 * total)
-    n_test = total - n_train - n_val
-    train_ds, val_ds, test_ds = random_split(dataset, [n_train, n_val, n_test], generator=torch.Generator().manual_seed(42))
-    train_loader = DataLoader(train_ds, batch_size=256, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=256, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False)
-
-    model = FPINN(mapping_size=32, scale=10.0, hidden_dim=128, num_hidden_layers=8, output_dim=9)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    train_loop(model, train_loader, val_loader, test_loader, num_epochs=500, lr=1e-3, device=device, weight_phys=1.0, early_stop_patience=20)
+# =======================
+# Run Pipeline
+# =======================
+def run_fpinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler, device='cuda'):
+    model = FPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=4, output_dim=9)
+    train_fpinn(
+        model, train_loader, val_loader, num_epochs=500, lr=1e-3,      
+        model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'fpinn.pth'),
+        log_path=os.path.join(os.path.dirname(__file__), 'logs', 'fpinn.log'),
+        device=device, early_stop_patience=20, x_scaler=x_scaler, y_scaler=y_scaler)
+    test_fpinn(
+        model, test_loader, device=device, x_scaler=x_scaler, y_scaler=y_scaler,
+        log_path=os.path.join(os.path.dirname(__file__), 'logs', 'fpinn.log')
+    )
 
 if __name__ == "__main__":
-    run_fpinn_pipeline()
+    train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
+    train_dataset = TBPDataset(train_file_list)  # For testing, limit to 100 files
+    train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
+    print(f"Loaded train dataset with {len(train_dataset)} samples.")
+    
+    test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_ds = TBPDataset(test_file_list)
+    print(f"Loaded test dataset with {len(test_ds)} samples.")
+    
+    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    x_scaler, y_scaler = compute_scalers(train_loader, device)
+    print("Computed data scalers for training data.")
+    run_fpinn_pipeline(
+        train_loader, val_loader, test_loader, 
+        x_scaler=x_scaler, y_scaler=y_scaler, device=device
+    )

@@ -19,43 +19,79 @@ class StandardScaler:
         return X * self.std_.view(1, -1, 1) + self.mean_.view(1, -1, 1)
     
 def compute_scalers(loader, device):
-    xs, ys = [], []
+    # X: (B, C, N)
+    sum_x, sum_x2, total = 0.0, 0.0, 0
+    sum_y, sum_y2 = 0.0, 0.0
+
     for xb, yb, _, _ in loader:
-        xs.append(xb)
-        ys.append(yb)
-    x_all = torch.cat(xs, dim=0).to(device)
-    y_all = torch.cat(ys, dim=0).to(device)
-    sx, sy = StandardScaler().fit(x_all), StandardScaler().fit(y_all)
+        xb = xb.to(device)
+        yb = yb.to(device)
+
+        B, C, N = xb.shape
+        x_flat = xb.permute(0, 2, 1).reshape(-1, C)  # (B*N, C)
+        y_flat = yb.permute(0, 2, 1).reshape(-1, yb.shape[1])
+
+        sum_x += x_flat.sum(dim=0)
+        sum_x2 += (x_flat ** 2).sum(dim=0)
+
+        sum_y += y_flat.sum(dim=0)
+        sum_y2 += (y_flat ** 2).sum(dim=0)
+
+        total += x_flat.shape[0]
+
+    mean_x = sum_x / total
+    std_x = (sum_x2 / total - mean_x**2).sqrt() + 1e-8
+
+    mean_y = sum_y / total
+    std_y = (sum_y2 / total - mean_y**2).sqrt() + 1e-8
+
+    sx = StandardScaler()
+    sy = StandardScaler()
+    sx.mean_, sx.std_ = mean_x, std_x
+    sy.mean_, sy.std_ = mean_y, std_y
     return sx, sy
 
+
 class TBPDataset(Dataset):
-    def __init__(self, filelist):
+    def __init__(self, filelist, preload=True):
+        self.filelist = filelist
         self.data = []
-        for fname in filelist:
-            base = os.path.basename(fname).split('_')[0]
-            masses = np.array([float(x) for x in base.replace('m', '').split('-')])
-            df = pd.read_csv(fname, header=None)
-            t = df.iloc[:, 0].values
-            r = df.iloc[:, 1:10].values.T
-            v = df.iloc[:, 10:19].values.T
-            r0 = df.iloc[0, 1:10].values
-            v0 = df.iloc[0, 10:19].values
-            N = len(t)
-            r0_mat = np.tile(r0[:, None], (1, N))
-            v0_mat = np.tile(v0[:, None], (1, N))
-            m_mat = np.tile(masses[:, None], (1, N))
-            t_mat = t[None, :]
-            x = np.concatenate([r0_mat, v0_mat, m_mat, t_mat], axis=0)
-            self.data.append((x, r, v, masses))
+
+        if preload:
+            for fname in self.filelist:
+                data = torch.load(fname)
+
+                t = data["t"]
+                r = data["r"].permute(0, 2, 1).reshape(len(t), -1).permute(1, 0)  # (T, 3, 3) → (9, T)
+                v = data["v"].permute(0, 2, 1).reshape(len(t), -1).permute(1, 0)
+
+                r0 = data["r0"].reshape(-1, 1).repeat(1, len(t))
+                v0 = data["v0"].reshape(-1, 1).repeat(1, len(t))
+                m = data["m"].reshape(-1, 1).repeat(1, len(t))
+                t_mat = t.unsqueeze(0).repeat(1, 1)
+
+                x = torch.cat([r0, v0, m, t_mat], dim=0)  # (22, T)
+                self.data.append((x, r, v, data["m"]))
+        else:
+            self.data = None
 
     def __len__(self):
-        return len(self.data)
+        return len(self.filelist)
 
     def __getitem__(self, idx):
-        x, r, v, m = self.data[idx]
-        return (
-            torch.tensor(x, dtype=torch.float32),  # (22, N)
-            torch.tensor(r, dtype=torch.float32),  # (9, N)
-            torch.tensor(v, dtype=torch.float32),  # (9, N)
-            torch.tensor(m, dtype=torch.float32),  # (3,)
-        )
+        if self.data is not None:
+            return self.data[idx]
+        else:
+            data = torch.load(self.filelist[idx])
+            t = data["t"]
+            r = data["r"].permute(0, 2, 1).reshape(len(t), -1).permute(1, 0)
+            v = data["v"].permute(0, 2, 1).reshape(len(t), -1).permute(1, 0)
+
+            r0 = data["r0"].reshape(-1, 1).repeat(1, len(t))
+            v0 = data["v0"].reshape(-1, 1).repeat(1, len(t))
+            m = data["m"].reshape(-1, 1).repeat(1, len(t))
+            t_mat = t.unsqueeze(0).repeat(1, 1)
+            x = torch.cat([r0, v0, m, t_mat], dim=0)
+            return x, r, v, data["m"]
+
+

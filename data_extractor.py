@@ -146,9 +146,6 @@ def plot_combined_model_data():
     plt.close()
     
 if __name__ == '__main__':
-    data = extract_single_model_data()
-    plot_single_model_data(data)
-    print("Data extraction and plotting completed.")
     plot_combined_model_data()
     
     

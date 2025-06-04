@@ -89,7 +89,7 @@ def train_respinn(
     model, train_loader, val_loader, num_epochs=500, lr=1e-3,
     device='cuda', model_save_path='respinn.pth',
     x_scaler=None, y_scaler=None,
-    log_path='respinn.log', early_stop_patience=20,
+    log_path='respinn.log', early_stop_patience=100,
     phys_loss_weight=1e-7
 ):
     model = model.to(device)
@@ -196,7 +196,7 @@ def run_respinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scal
         device=device, 
         model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'respinn.pth'),
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'respinn.log'),
-        early_stop_patience=20, x_scaler=x_scaler, y_scaler=y_scaler)
+        x_scaler=x_scaler, y_scaler=y_scaler)
     test_respinn(
         model, test_loader, device=device, x_scaler=x_scaler, y_scaler=y_scaler,
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'respinn.log')
@@ -204,19 +204,20 @@ def run_respinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scal
 
 if __name__ == "__main__":
     train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
-    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
-    train_dataset = TBPDataset(train_file_list)  # For testing, limit to 100 files
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.pt')]
+    train_dataset = TBPDataset(train_file_list[:10000], preload=False)  # For testing, limit to 100 files
     train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
     print(f"Loaded train dataset with {len(train_dataset)} samples.")
     
     test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
-    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.pt')]
     test_ds = TBPDataset(test_file_list)
     print(f"Loaded test dataset with {len(test_ds)} samples.")
     
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=1024, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    print (f"Created DataLoaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)

@@ -1,8 +1,3 @@
-# =====================
-# OL-PINN Pipeline
-# =====================
-# DeepONet 사전학습 → 사전학습된 feature를 PINN 입력에 결합하여 residual 보정 학습
-
 import os
 import torch
 import torch.nn as nn
@@ -12,35 +7,98 @@ from DataLoader import TBPDataset, compute_scalers
 from DeepONet import DeepONet
 from PINN import PINN, compute_second_derivative, compute_gravity_acceleration
 
-class OL_PINN(nn.Module):
-    def __init__(self, deeponet_ckpt, input_dim=22, hidden_dim=128, depth=4, output_dim=9, device='cuda'):
+class GeneralOLPINN(nn.Module):
+    def __init__(self, 
+                 base_type='DeepONet',  # 'DeepONet', 'FNO', 'TFNO'
+                 correction_type='PINN',  # 'PINN', 'FPINN', 'ResPINN'
+                 base_ckpt=None,
+                 input_dim=22, output_dim=9, device='cuda',
+                 **kwargs):
         super().__init__()
         self.device = device
-        self.deeponet = DeepONet(branch_dim=21, trunk_dim=1, output_dim=output_dim).to(device)
-        self.deeponet.load_state_dict(torch.load(deeponet_ckpt, map_location=device))
-        self.deeponet.eval()  # freeze
-        for param in self.deeponet.parameters():
-            param.requires_grad = False
+        self.base_type = base_type.lower()
+        self.correction_type = correction_type.lower()
 
-        # PINN은 DeepONet의 출력을 보정함
-        self.pinn = PINN(input_dim=input_dim, hidden_dim=hidden_dim, depth=depth, output_dim=output_dim).to(device)
+        # --- Base Model ---
+        if self.base_type == 'deeponet':
+            from DeepONet import DeepONet
+            self.base_model = DeepONet(
+                branch_dim=21, trunk_dim=1, hidden_branch=128, hidden_trunk=128,
+                p=128, output_dim=9, num_branch_layers=4, num_trunk_layers=4
+            ).to(device)
+            if base_ckpt:
+                self.base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+            self.base_model.eval()
+            for param in self.base_model.parameters():
+                param.requires_grad = False
 
-    def forward(self, xb):
-        # xb: (B, D, N) → 3체 기준 D=22, N=시점 수
+        elif self.base_type == 'fno':
+            from FNO import FNO
+            self.base_model = FNO(modes=32, width=64, input_dim=22, output_dim=9, depth=4).to(device)
+            if base_ckpt:
+                self.base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+            self.base_model.eval()
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+
+        elif self.base_type == 'tfno':
+            from TFNO import TFNO
+            self.base_model = TFNO(
+                t_steps=100, input_dim=22, embed_dim=32, width=64, modes=32,
+                depth=4, output_dim=9
+            ).to(device)
+            if base_ckpt:
+                self.base_model.load_state_dict(torch.load(base_ckpt, map_location=device))
+            self.base_model.eval()
+            for param in self.base_model.parameters():
+                param.requires_grad = False
+
+        else:
+            raise ValueError(f"Unknown base_type: {base_type}")
+
+        # --- Correction Model ---
+        if self.correction_type == 'pinn':
+            from PINN import PINN
+            self.correction = PINN(input_dim=22, hidden_dim=128, depth=4, output_dim=9).to(device)
+
+        elif self.correction_type == 'fpinn':
+            from FPINN import FPINN
+            self.correction = FPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=4, output_dim=9).to(device)
+
+        elif self.correction_type == 'respinn':
+            from ResPINN import ResPINN
+            self.correction = ResPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=6, output_dim=9).to(device)
+
+        else:
+            raise ValueError(f"Unknown correction_type: {correction_type}")
+
+    def forward(self, xb):  # xb: (B, D, N)
+        B, D, N = xb.shape
+
+        # --- Base prediction ---
         with torch.no_grad():
-            B, D, N = xb.shape
-            branch_input = xb[:, :21, :].mean(dim=2)   # (B, 21)
-            trunk_input = xb[:, 21:, :].permute(0, 2, 1)  # (B, N, 1)
-            base_pred = self.deeponet(branch_input, trunk_input)  # (B, 9, N)
+            if self.base_type == 'deeponet':
+                branch_input = xb[:, :21, :].mean(dim=2)  # (B, 21)
+                trunk_input = xb[:, 21:, :].permute(0, 2, 1)  # (B, N, 1)
+                base_pred = self.base_model(branch_input, trunk_input)  # (B, 9, N)
+            else:
+                base_pred = self.base_model(xb)
 
-        residual = self.pinn(xb)  # (B, 9, N)
+        # --- Residual correction ---
+        if self.correction_type == 'pinn':
+            residual = self.correction(xb)  # (B, 9, N)
+        else:
+            x_cond = xb[:, :21, 0]                 # (B, 21)
+            t = xb[:, 21:, :].permute(0, 2, 1)     # (B, N, 1)
+            residual = self.correction(x_cond, t)  # (B, 9, N)
+
         return base_pred + residual
 
 def train_ol_pinn(model, train_loader, val_loader, x_scaler, y_scaler, 
-                  model_save_path, log_path, num_epochs=500, lr=1e-3, early_stop_patience=20,
-                  device='cuda', phys_loss_weight=3):
+                  model_save_path, log_path, num_epochs=10000, lr=1e-3, early_stop_patience=50,
+                  device='cuda', phys_loss_weight=1e-5):
     model = model.to(device)
-    optimizer = torch.optim.Adam(model.pinn.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.correction.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
     best_val = float('inf')
     patience = 0
@@ -48,27 +106,39 @@ def train_ol_pinn(model, train_loader, val_loader, x_scaler, y_scaler,
     with open(log_path, "w") as f:
         f.write("epoch,train_loss,train_phys,val_loss,val_phys\n")
 
+    def compute_loss(xb, yb, mb, is_train=True):
+        xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
+        t = xb[:, -1, :]
+        x_scaled, y_scaled = x_scaler.transform(xb), y_scaler.transform(yb)
+
+        if is_train:
+            optimizer.zero_grad()
+
+        y_pred = model(x_scaled)
+        loss_data = loss_fn(y_pred, y_scaled)
+
+        y_pred_phys = y_scaler.inverse_transform(y_pred)
+        from PINN import compute_second_derivative, compute_gravity_acceleration
+        a_pred = compute_second_derivative(y_pred_phys, t)
+        a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]
+        loss_phys = ((a_pred - a_grav) ** 2).mean()
+        loss_phys_scaled = loss_phys * (loss_data.detach() / (loss_phys.detach() + 1e-8))
+        loss = loss_data + phys_loss_weight * loss_phys_scaled
+
+        if is_train:
+            loss.backward()
+            optimizer.step()
+
+        return loss_data.item(), loss_phys.item(), xb.size(0)
+
     for epoch in range(num_epochs):
         model.train()
         train_loss, train_phys, n = 0.0, 0.0, 0
         for xb, yb, _, mb in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
-            xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-            t = xb[:, -1, :]
-            x_scaled, y_scaled = x_scaler.transform(xb), y_scaler.transform(yb)
-            optimizer.zero_grad()
-            y_pred = model(x_scaled)
-            loss_data = loss_fn(y_pred, y_scaled)
-            y_pred_phys = y_scaler.inverse_transform(y_pred)
-            a_pred = compute_second_derivative(y_pred_phys, t)
-            a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]
-            loss_phys = ((a_pred - a_grav) ** 2).mean()
-            loss_phys_scaled = loss_phys * (loss_data.detach() / (loss_phys.detach() + 1e-8))
-            loss = loss_data + phys_loss_weight * loss_phys_scaled
-            loss.backward()
-            optimizer.step()
-            train_loss += loss_data.item() * xb.size(0)
-            train_phys += loss_phys.item() * xb.size(0)
-            n += xb.size(0)
+            l_data, l_phys, bsz = compute_loss(xb, yb, mb, is_train=True)
+            train_loss += l_data * bsz
+            train_phys += l_phys * bsz
+            n += bsz
         train_loss /= n
         train_phys /= n
 
@@ -76,20 +146,10 @@ def train_ol_pinn(model, train_loader, val_loader, x_scaler, y_scaler,
         val_loss, val_phys, nv = 0.0, 0.0, 0
         with torch.no_grad():
             for xb, yb, _, mb in tqdm(val_loader, desc=f"Val {epoch+1}", leave=False):
-                xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
-                t = xb[:, -1, :]
-                x_scaled, y_scaled = x_scaler.transform(xb), y_scaler.transform(yb)
-                y_pred = model(x_scaled)
-                loss_data = loss_fn(y_pred, y_scaled)
-                y_pred_phys = y_scaler.inverse_transform(y_pred)
-                a_pred = compute_second_derivative(y_pred_phys, t)
-                a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]
-                loss_phys = ((a_pred - a_grav) ** 2).mean()
-                loss_phys_scaled = loss_phys * (loss_data.detach() / (loss_phys.detach() + 1e-8))
-                loss = loss_data + phys_loss_weight * loss_phys_scaled
-                val_loss += loss_data.item() * xb.size(0)
-                val_phys += loss_phys.item() * xb.size(0)
-                nv += xb.size(0)
+                l_data, l_phys, bsz = compute_loss(xb, yb, mb, is_train=False)
+                val_loss += l_data * bsz
+                val_phys += l_phys * bsz
+                nv += bsz
         val_loss /= nv
         val_phys /= nv
 
@@ -129,29 +189,185 @@ def test_ol_pinn(model, test_loader, x_scaler, y_scaler, device='cuda', log_path
     return test_loss
 
 def run_ol_pinn_pipeline():
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.pt')]
+    train_dataset = TBPDataset(train_file_list[:], preload=False)  # For testing, limit to 100 files
+    train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
+    print(f"Loaded train dataset with {len(train_dataset)} samples.")
+    
     test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
-    train_files = [os.path.join(train_dir, f) for f in os.listdir(train_dir) if f.endswith('.csv')]
-    test_files = [os.path.join(test_dir, f) for f in os.listdir(test_dir) if f.endswith('.csv')]
-
-    dataset = TBPDataset(train_files)
-    train_ds, val_ds, _ = random_split(dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
-    test_ds = TBPDataset(test_files)
-
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
-
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.pt')]
+    test_ds = TBPDataset(test_file_list)
+    print(f"Loaded test dataset with {len(test_ds)} samples.")
+    
+    train_loader = DataLoader(train_ds, batch_size=1024, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    print (f"Created DataLoaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)
 
-    model = OL_PINN(
-        deeponet_ckpt=os.path.join(os.path.dirname(__file__), 'models', 'deeponet.pth'),
-        input_dim=22, hidden_dim=128, depth=4, output_dim=9, device=device
+    model = GeneralOLPINN(
+        base_type='FNO', 
+        correction_type='PINN', 
+        base_ckpt='models/fno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
     )
 
-    model_path = os.path.join(os.path.dirname(__file__), 'models', 'ol_pinn.pth')
-    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'ol_pinn.log')
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_fno_pinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_fno_pinn.log')
+
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='TFNO', 
+        correction_type='PINN', 
+        base_ckpt='models/tfno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_tfno_pinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_tfno_pinn.log')
+
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='DeepONet', 
+        correction_type='PINN', 
+        base_ckpt='models/deeponet.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+    
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_deeponet_pinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_deeponet_pinn.log')
+    
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+    
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='FNO', 
+        correction_type='FPINN', 
+        base_ckpt='models/fno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_fno_fpinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_fno_fpinn.log')
+
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='TFNO', 
+        correction_type='FPINN', 
+        base_ckpt='models/tfno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+    
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_tfno_fpinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_tfno_fpinn.log')
+    
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='DeepONet', 
+        correction_type='FPINN', 
+        base_ckpt='models/deeponet.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+    
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_deeponet_fpinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_deeponet_fpinn.log')
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+    
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='FNO', 
+        correction_type='ResPINN', 
+        base_ckpt='models/fno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_fno_respinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_fno_respinn.log')
+
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='TFNO', 
+        correction_type='ResPINN', 
+        base_ckpt='models/tfno.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_tfno_respinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_tfno_respinn.log')
+
+    train_ol_pinn(
+        model, train_loader, val_loader, x_scaler, y_scaler,
+        model_save_path=model_path,
+        log_path=log_path,
+        device=device
+    )
+
+    test_ol_pinn(model, test_loader, x_scaler, y_scaler, device=device, log_path=log_path)
+    
+    model = GeneralOLPINN(
+        base_type='DeepONet', 
+        correction_type='ResPINN', 
+        base_ckpt='models/deeponet.pth',
+        input_dim=22, output_dim=9, t_steps=100, device='cuda'
+    )
+
+    model_path = os.path.join(os.path.dirname(__file__), 'models', 'residual_deeponet_respinn.pth')
+    log_path = os.path.join(os.path.dirname(__file__), 'logs', 'residual_deeponet_respinn.log')
 
     train_ol_pinn(
         model, train_loader, val_loader, x_scaler, y_scaler,

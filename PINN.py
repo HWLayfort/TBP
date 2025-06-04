@@ -55,7 +55,6 @@ def compute_second_derivative(y, t):
 
     return (y_next - 2 * y_curr + y_prev) / (dt ** 2)
 
-
 def compute_gravity_acceleration(r, masses, G=1.0, eps=1e-8):
     B, _, N = r.shape
     r = r.view(B, 3, 3, N)
@@ -68,6 +67,16 @@ def compute_gravity_acceleration(r, masses, G=1.0, eps=1e-8):
                 a[:, i, :, :] += G * masses[:, j].unsqueeze(-1).unsqueeze(-1) * rij / (dist ** 3)
     return a.view(B, 9, N)
 
+def get_phys_weight(epoch, warmup_end=10, peak_epoch=50, init_weight=1e-7, decay_rate=0.98):
+    if epoch < warmup_end:
+        return 0.0
+    elif warmup_end <= epoch < peak_epoch:
+        # 선형 증가
+        return init_weight * ((epoch - warmup_end) / (peak_epoch - warmup_end))
+    else:
+        # 지수 감소
+        return init_weight * (decay_rate ** (epoch - peak_epoch))
+
 # =====================
 # Training Loop
 # =====================
@@ -75,7 +84,7 @@ def train_pinn(
     model, train_loader, val_loader, num_epochs=100, lr=1e-3, device='cuda',
     x_scaler=None, y_scaler=None,
     model_save_path='pinn.pth', log_path='pinn.log', early_stop_patience=50,
-    phys_loss_weight=1e-7,
+    phys_loss_weight_init=1, phys_weight_decay=0.98,
 ):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -87,6 +96,13 @@ def train_pinn(
     
     for epoch in range(num_epochs):
         model.train()
+        phys_loss_weight = get_phys_weight(
+            epoch,
+            warmup_end=10,        # 예: 10 에폭까지는 무시
+            peak_epoch=50,        # 50 에폭에 최대 weight 도달
+            init_weight=phys_loss_weight_init,
+            decay_rate=phys_weight_decay
+        )
         train_loss, train_phys, n = 0.0, 0.0, 0
         for xb, yb, _, mb in tqdm(train_loader, desc=f"Train {epoch+1}", leave=False):
             xb, yb, mb = xb.to(device), yb.to(device), mb.to(device)
@@ -99,8 +115,7 @@ def train_pinn(
             a_pred = compute_second_derivative(y_pred_phys, t)
             a_grav = compute_gravity_acceleration(y_pred_phys, mb)[:, :, 1:-1]  # <--- 수정
             loss_phys = ((a_pred - a_grav) ** 2).mean()
-            loss_phys_scaled = loss_phys * (loss_data.detach() / (loss_phys.detach() + 1e-8))
-            loss = loss_data + phys_loss_weight * loss_phys_scaled
+            loss = loss_data + phys_loss_weight * loss_phys
             loss.backward()
             optimizer.step()
             train_loss += loss_data.item() * xb.size(0)
@@ -175,8 +190,7 @@ def run_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler,
                x_scaler=x_scaler, y_scaler=y_scaler,
                 model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'pinn.pth'),
                 log_path=os.path.join(os.path.dirname(__file__), 'logs', 'pinn.log'),
-               early_stop_patience=20,
-               phys_loss_weight=0.5)
+               early_stop_patience=1000)
     test_pinn(
         model, test_loader, device=device, x_scaler=x_scaler, y_scaler=y_scaler,
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'pinn.log')
@@ -184,19 +198,20 @@ def run_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler,
 
 if __name__ == "__main__":
     train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
-    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
-    train_dataset = TBPDataset(train_file_list)  # For testing, limit to 100 files
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.pt')]
+    train_dataset = TBPDataset(train_file_list[:10000], preload=False)  # For testing, limit to 100 files
     train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
     print(f"Loaded train dataset with {len(train_dataset)} samples.")
     
     test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
-    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.pt')]
     test_ds = TBPDataset(test_file_list)
     print(f"Loaded test dataset with {len(test_ds)} samples.")
     
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=1024, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    print (f"Created DataLoaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)

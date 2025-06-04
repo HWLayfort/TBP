@@ -195,15 +195,15 @@ def test_tfno(model, test_loader, x_scaler, y_scaler, device='cuda', log_path='t
 
 def run_tfno_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler, device='cuda'):
     # n_steps는 시계열 길이(파일마다 동일해야 함, 예시: 2000)
-    n_steps = 2000
+    n_steps = 100
     print(f"Number of time steps: {n_steps}")
     model = TFNO(
-        t_steps=2000, input_dim=22, embed_dim=32, width=64, modes=32,
+        t_steps=100, input_dim=22, embed_dim=32, width=64, modes=32,
         depth=4, output_dim=9
     )
     train_tfno(
         model, train_loader, val_loader, x_scaler=x_scaler, y_scaler=y_scaler,
-        num_epochs=500, lr=1e-3, device=device, 
+        num_epochs=10000, lr=1e-3, device=device, 
         model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'tfno.pth'),
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'tfno.log'),
         early_stop_patience=20
@@ -216,19 +216,20 @@ def run_tfno_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler,
     
 if __name__ == "__main__":
     train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
-    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
-    train_dataset = TBPDataset(train_file_list)
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.pt')]
+    train_dataset = TBPDataset(train_file_list[:10000], preload=False)  # For testing, limit to 100 files
     train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
     print(f"Loaded train dataset with {len(train_dataset)} samples.")
     
     test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
-    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.pt')]
     test_ds = TBPDataset(test_file_list)
     print(f"Loaded test dataset with {len(test_ds)} samples.")
     
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=1024, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    print (f"Created DataLoaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)

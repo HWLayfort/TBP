@@ -177,7 +177,7 @@ def run_multitask_fpinn_pipeline(train_loader, val_loader, test_loader, x_scaler
     
     model = FPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=4, output_dim=9)
     tfno_teacher = TFNO(
-        t_steps=2000, input_dim=22, embed_dim=32, width=64, modes=32,
+        t_steps=100, input_dim=22, embed_dim=32, width=64, modes=32,
         depth=4, output_dim=9
     )
     tfno_teacher.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), 'models', 'tfno.pth')))

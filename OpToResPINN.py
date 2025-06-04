@@ -152,7 +152,7 @@ def test_multitask_fpinn(
             f.write(f"test,{test_data},{test_phys}\n")
     return test_data, test_phys
 
-def run_multitask_fpinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler, device='cuda'):
+def run_multitask_deeponet_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler, device='cuda'):
     model = ResPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=6, output_dim=9)
     fno_teacher = FNO(modes=32, width=64, input_dim=22, output_dim=9, depth=4)
     fno_teacher.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), 'models', 'fno.pth')))
@@ -177,7 +177,7 @@ def run_multitask_fpinn_pipeline(train_loader, val_loader, test_loader, x_scaler
     
     model = ResPINN(input_dim=21, embed_dim=32, hidden_dim=128, depth=6, output_dim=9)
     tfno_teacher = TFNO(
-        t_steps=2000, input_dim=22, embed_dim=32, width=64, modes=32,
+        t_steps=100, input_dim=22, embed_dim=32, width=64, modes=32,
         depth=4, output_dim=9
     )
     tfno_teacher.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), 'models', 'tfno.pth')))
@@ -241,4 +241,4 @@ if __name__ == "__main__":
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)
-    run_multitask_fpinn_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler)
+    run_multitask_deeponet_pipeline(train_loader, val_loader, test_loader, x_scaler, y_scaler)

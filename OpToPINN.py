@@ -158,7 +158,7 @@ def run_multitask_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler,
         model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'fno_to_pinn.pth'),
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'fno_to_pinn.log'),
         lambda_data=1.0,
-        lambda_phys=0.5
+        lambda_phys=1e-5
     )
 
     test_multitask_pinn(
@@ -170,7 +170,7 @@ def run_multitask_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler,
     
     model = PINN(input_dim=22, hidden_dim=128, depth=4, output_dim=9)
     tfno_teacher = TFNO(
-        t_steps=2000, input_dim=22, embed_dim=32, width=64, modes=32,
+        t_steps=100, input_dim=22, embed_dim=32, width=64, modes=32,
         depth=4, output_dim=9
     )
     tfno_teacher.load_state_dict(torch.load(os.path.join(os.path.dirname(__file__), 'models', 'tfno.pth')))
@@ -183,7 +183,7 @@ def run_multitask_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler,
         model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'tfno_to_pinn.pth'),
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'tfno_to_pinn.log'),
         lambda_data=1.0,
-        lambda_phys=0.5
+        lambda_phys=1e-5
     )
     test_multitask_pinn(
         model, tfno_teacher, test_loader,
@@ -206,7 +206,7 @@ def run_multitask_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler,
         model_save_path=os.path.join(os.path.dirname(__file__), 'models', 'deeponet_to_pinn.pth'),
         log_path=os.path.join(os.path.dirname(__file__), 'logs', 'deeponet_to_pinn.log'),
         lambda_data=1.0,
-        lambda_phys=0.5,
+        lambda_phys=1e-5,
         teacher_model="deeponet"
     )
     test_multitask_pinn(
@@ -218,19 +218,20 @@ def run_multitask_pinn_pipeline(train_loader, val_loader, test_loader, x_scaler,
 
 if __name__ == "__main__":
     train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
-    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
-    train_dataset = TBPDataset(train_file_list)  # For testing, limit to 100 files
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.pt')]
+    train_dataset = TBPDataset(train_file_list[:10000], preload=False)  # For testing, limit to 100 files
     train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
     print(f"Loaded train dataset with {len(train_dataset)} samples.")
     
     test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
-    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.pt')]
     test_ds = TBPDataset(test_file_list)
     print(f"Loaded test dataset with {len(test_ds)} samples.")
     
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=128, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=1024, shuffle=True, num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=8, pin_memory=True, persistent_workers=True)
+    print (f"Created DataLoaders: train={len(train_loader)}, val={len(val_loader)}, test={len(test_loader)}")
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)

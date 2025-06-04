@@ -5,6 +5,9 @@ from ResPINN import run_respinn_pipeline
 from FNO import run_fno_pipeline
 from TFNO import run_tfno_pipeline
 from DeepONet import run_deeponet_pipeline
+from OpToPINN import run_multitask_pinn_pipeline
+from OpToFPINN import run_multitask_fpinn_pipeline
+from OpToResPINN import run_multitask_deeponet_pipeline
 
 import os
 import torch
@@ -31,23 +34,23 @@ def run_all_pipelines():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     x_scaler, y_scaler = compute_scalers(train_loader, device)
-    # print("Running FNO pipeline...")
-    # run_fno_pipeline(
-    #     train_loader, val_loader, test_loader, 
-    #     x_scaler=x_scaler, y_scaler=y_scaler, device=device
-    # )
+    print("Running FNO pipeline...")
+    run_fno_pipeline(
+        train_loader, val_loader, test_loader, 
+        x_scaler=x_scaler, y_scaler=y_scaler, device=device
+    )
     
-    # print("Running TFNO pipeline...")
-    # run_tfno_pipeline(
-    #     train_loader, val_loader, test_loader, 
-    #     x_scaler=x_scaler, y_scaler=y_scaler, device=device
-    # )
+    print("Running TFNO pipeline...")
+    run_tfno_pipeline(
+        train_loader, val_loader, test_loader, 
+        x_scaler=x_scaler, y_scaler=y_scaler, device=device
+    )
     
-    # print("Running DeepONet pipeline...")
-    # run_deeponet_pipeline(
-    #     train_loader, val_loader, test_loader, 
-    #     x_scaler=x_scaler, y_scaler=y_scaler, device=device
-    # )
+    print("Running DeepONet pipeline...")
+    run_deeponet_pipeline(
+        train_loader, val_loader, test_loader, 
+        x_scaler=x_scaler, y_scaler=y_scaler, device=device
+    )
     
     print("Running PINN pipeline...")
     run_pinn_pipeline(
@@ -67,15 +70,41 @@ def run_all_pipelines():
         x_scaler=x_scaler, y_scaler=y_scaler, device=device
     )
     
-# def run_all_tranfer_pipelines():
-#     print("Running FNO to PINN transfer pipeline...")
-#     # run_fnotopinn_pipeline()
+def run_all_transfer_pipelines():
+    train_dir = os.path.join(os.path.dirname(__file__), "data", "train")
+    train_file_list = [os.path.join(train_dir, fname) for fname in os.listdir(train_dir) if fname.endswith('.csv')]
+    train_dataset = TBPDataset(train_file_list)  # For testing, limit to 100 files
+    train_ds, val_ds, _ = random_split(train_dataset, [0.8, 0.2, 0], generator=torch.Generator().manual_seed(42))
+    print(f"Loaded train dataset with {len(train_dataset)} samples.")
     
-#     print("Running TFNO to PINN transfer pipeline...")
-#     run_tfnotopinn_pipeline()
+    test_dir = os.path.join(os.path.dirname(__file__), "data", "test")
+    test_file_list = [os.path.join(test_dir, fname) for fname in os.listdir(test_dir) if fname.endswith('.csv')]
+    test_ds = TBPDataset(test_file_list)
+    print(f"Loaded test dataset with {len(test_ds)} samples.")
     
-#     print("Running DeepONet to PINN transfer pipeline...")
-#     # run_deeponettopinn_pipeline()
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    print("Running FNO to PINN pipeline...")
+    run_multitask_pinn_pipeline(
+        train_loader, val_loader, test_loader, 
+        device=device
+    )
+    
+    print("Running TFNO to PINN pipeline...")
+    run_multitask_fpinn_pipeline(
+        train_loader, val_loader, test_loader, 
+        device=device
+    )
+    
+    print("Running DeepONet to PINN pipeline...")
+    run_multitask_deeponet_pipeline(
+        train_loader, val_loader, test_loader, 
+        device=device
+    )
     
 if __name__ == "__main__":
     run_all_pipelines()
